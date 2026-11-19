@@ -1,4 +1,6 @@
+import time
 import ccxt
+import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import requests
@@ -37,6 +39,19 @@ st.sidebar.header("2. 自动刷新")
 refresh_sec = st.sidebar.slider("刷新间隔(秒)", min_value=5, max_value=60, value=15, step=5)
 auto_refresh = st.sidebar.checkbox("开启静默自动刷新", value=True)
 
+st.sidebar.header("3. 策略过滤与去重")
+enable_rsi_assist = st.sidebar.checkbox("启用 RSI(14) 辅助提示", value=True)
+dedup_pct = st.sidebar.number_input(
+    "价格去重间距 (%)",
+    min_value=0.1,
+    max_value=10.0,
+    value=0.6,
+    step=0.1,
+    format="%.2f",
+    help="同交易所、同币种、同档位、同方向下，新价格与上一条参考价差距小于该比例时不重复出单",
+)
+max_strategy_items = st.sidebar.slider("最多保留策略条数", min_value=3, max_value=15, value=6, step=1)
+
 # 持仓与出单提示状态初始化（支持一键填入短线参考）
 for k, default_v in [
     ("pos_direction", "做多 (Long)"),
@@ -48,7 +63,10 @@ for k, default_v in [
     if k not in st.session_state:
         st.session_state[k] = default_v
 
-st.sidebar.header("3. 持仓与出单提示")
+if "strategy_vault" not in st.session_state:
+    st.session_state["strategy_vault"] = {}
+
+st.sidebar.header("4. 持仓与出单提示")
 direction = st.sidebar.selectbox("持仓方向", ["做多 (Long)", "做空 (Short)"], key="pos_direction")
 entry_price = st.sidebar.number_input(
     "开仓均价", min_value=0.0, step=0.1, format="%.4f", key="pos_entry_price"
@@ -70,6 +88,17 @@ def _fmt_price(val: float) -> str:
     if abs(val) >= 1:
         return f"${val:,.4f}"
     return f"${val:,.6f}"
+
+
+def _calc_rsi(close: pd.Series, period: int = 14) -> pd.Series:
+    delta = close.diff()
+    gain = delta.clip(lower=0.0)
+    loss = -delta.clip(upper=0.0)
+    avg_gain = gain.ewm(alpha=1 / period, min_periods=period, adjust=False).mean()
+    avg_loss = loss.ewm(alpha=1 / period, min_periods=period, adjust=False).mean()
+    rs = avg_gain / avg_loss.replace(0.0, np.nan)
+    rsi = 100.0 - (100.0 / (1.0 + rs))
+    return rsi.fillna(50.0)
 
 
 def _fetch_weex_contract_klines(coin: str, tf: str, lim: int) -> pd.DataFrame:
@@ -148,6 +177,7 @@ def fetch_ohlcv_by_exchange(ex_name: str, symbol: str, tf: str, lim: int) -> pd.
 
     df["ema7"] = df["close"].ewm(span=7, adjust=False).mean()
     df["ema25"] = df["close"].ewm(span=25, adjust=False).mean()
+    df["rsi14"] = _calc_rsi(df["close"], period=14)
     return df
 
 
@@ -198,154 +228,184 @@ def _build_dynamic_advice(
         return ("info", "⏳ 空单持仓观察中：留意 EMA7 阻力与 TP1/TP2 距离。")
 
 
-def _detect_dual_short_strategies(df: pd.DataFrame) -> dict[str, dict]:
+def _rsi_note(side: str, rsi_val: float, use_rsi: bool) -> str:
+    if not use_rsi:
+        return ""
+    if side.startswith("做多"):
+        if rsi_val >= 72:
+            return f"｜RSI(14)={rsi_val:.1f} 偏高，注意短线冲高回落、别追太高"
+        if rsi_val <= 35:
+            return f"｜RSI(14)={rsi_val:.1f} 偏低回升，顺势留意企稳"
+        return f"｜RSI(14)={rsi_val:.1f} 处于中性区间"
+    if side.startswith("做空"):
+        if rsi_val <= 28:
+            return f"｜RSI(14)={rsi_val:.1f} 偏低，防短线超跌反弹、别在地板追空"
+        if rsi_val >= 65:
+            return f"｜RSI(14)={rsi_val:.1f} 偏高回落，顺势留意阻力"
+        return f"｜RSI(14)={rsi_val:.1f} 处于中性区间"
+    return f"｜RSI(14)={rsi_val:.1f}"
+
+
+def _evaluate_candidate_strategies(df: pd.DataFrame, use_rsi: bool) -> list[dict]:
     last_p = float(df["close"].iloc[-1])
     prev_p = float(df["close"].iloc[-2]) if len(df) > 1 else last_p
     ema7 = float(df["ema7"].iloc[-1])
     prev_ema7 = float(df["ema7"].iloc[-2]) if len(df) > 1 else ema7
     ema25 = float(df["ema25"].iloc[-1])
     prev_ema25 = float(df["ema25"].iloc[-2]) if len(df) > 1 else ema25
+    rsi_val = float(df["rsi14"].iloc[-1]) if "rsi14" in df.columns else 50.0
 
+    # 震荡过滤：结合 EMA7/EMA25 间距与近 12 根 K 线高低振幅
     spread_pct = abs(ema7 - ema25) / ema25 * 100 if ema25 else 0.0
+    win = df.tail(min(len(df), 12))
+    range_pct = ((float(win["high"].max()) - float(win["low"].min())) / last_p * 100) if last_p else 0.0
+    is_choppy = spread_pct < 0.25 or range_pct < 0.85
+
     ema7_up = ema7 > prev_ema7
     ema7_down = ema7 < prev_ema7
     ema25_up = ema25 >= prev_ema25
     ema25_down = ema25 <= prev_ema25
-
-    # 1. 稳健短线档（偏重均线结构与顺势回踩，止损/止盈相对宽容）
-    if spread_pct < 0.25 and not (ema7_up and ema25_up) and not (ema7_down and ema25_down):
-        steady = {
-            "mode": "稳健短线",
-            "side": "观望 (Wait)",
-            "badge": "🟡 震荡观望",
-            "reason": "EMA7 与 EMA25 贴近缠绕，均线方向尚未拉开，短线易来回洗盘，建议等结构走清。",
-            "entry": last_p,
-            "sl_pct": 1.2,
-            "tp1_pct": 1.8,
-            "tp2_pct": 3.2,
-            "can_apply": False,
-        }
-    elif ema7 > ema25 and ema7_up and ema25_up and last_p >= ema25:
-        steady = {
-            "mode": "稳健短线",
-            "side": "做多 (Long)",
-            "badge": "🟢 偏多顺势",
-            "reason": (
-                "EMA7 位于 EMA25 上方且双均线向上，价格回踩 EMA7 附近企稳。"
-                if abs(last_p - ema7) / ema7 <= 0.008
-                else "EMA7 位于 EMA25 上方且双均线向上，多头结构完整，偏顺势做多参考。"
-            ),
-            "entry": last_p,
-            "sl_pct": 1.2,
-            "tp1_pct": 1.8,
-            "tp2_pct": 3.5,
-            "can_apply": True,
-        }
-    elif ema7 < ema25 and ema7_down and ema25_down and last_p <= ema25:
-        steady = {
-            "mode": "稳健短线",
-            "side": "做空 (Short)",
-            "badge": "🔴 偏空顺势",
-            "reason": (
-                "EMA7 位于 EMA25 下方且双均线向下，价格反弹靠近 EMA7 受阻。"
-                if abs(last_p - ema7) / ema7 <= 0.008
-                else "EMA7 位于 EMA25 下方且双均线向下，空头结构延续，偏顺势做空参考。"
-            ),
-            "entry": last_p,
-            "sl_pct": 1.2,
-            "tp1_pct": 1.8,
-            "tp2_pct": 3.5,
-            "can_apply": True,
-        }
-    else:
-        steady = {
-            "mode": "稳健短线",
-            "side": "观望 (Wait)",
-            "badge": "🟡 结构过渡",
-            "reason": "当前价格与 EMA7/EMA25 处于转换阶段，方向一致性一般，建议先观察确认。",
-            "entry": last_p,
-            "sl_pct": 1.1,
-            "tp1_pct": 1.6,
-            "tp2_pct": 3.0,
-            "can_apply": False,
-        }
-
-    # 2. 快节奏短线档（偏重近期 EMA7 拐头与短线动能，止损/止盈更紧凑）
     cross_up = prev_ema7 <= prev_ema25 and ema7 > ema25
     cross_down = prev_ema7 >= prev_ema25 and ema7 < ema25
 
-    if (cross_up or (ema7_up and last_p > ema7 and last_p > prev_p)):
-        fast = {
+    candidates: list[dict] = []
+
+    # 1. 稳健短线档（偏顺势均线结构 + 震荡过滤）
+    if not is_choppy and ema7 > ema25 and ema7_up and ema25_up and last_p >= ema25:
+        pullback = abs(last_p - ema7) / ema7 <= 0.008
+        reason = (
+            "震荡过滤通过，EMA7 高于 EMA25 且双均线向上，价格回踩 EMA7 附近企稳。"
+            if pullback
+            else "震荡过滤通过，EMA7 高于 EMA25 且双均线向上，多头结构顺势参考。"
+        )
+        candidates.append({
+            "mode": "稳健短线",
+            "side": "做多 (Long)",
+            "badge": "🟢 稳健做多",
+            "reason": reason + _rsi_note("做多 (Long)", rsi_val, use_rsi),
+            "entry": last_p,
+            "sl_pct": 1.2,
+            "tp1_pct": 1.8,
+            "tp2_pct": 3.5,
+        })
+    elif not is_choppy and ema7 < ema25 and ema7_down and ema25_down and last_p <= ema25:
+        rebound = abs(last_p - ema7) / ema7 <= 0.008
+        reason = (
+            "震荡过滤通过，EMA7 低于 EMA25 且双均线向下，价格反弹靠近 EMA7 受阻。"
+            if rebound
+            else "震荡过滤通过，EMA7 低于 EMA25 且双均线向下，空头结构顺势参考。"
+        )
+        candidates.append({
+            "mode": "稳健短线",
+            "side": "做空 (Short)",
+            "badge": "🔴 稳健做空",
+            "reason": reason + _rsi_note("做空 (Short)", rsi_val, use_rsi),
+            "entry": last_p,
+            "sl_pct": 1.2,
+            "tp1_pct": 1.8,
+            "tp2_pct": 3.5,
+        })
+
+    # 2. 快节奏短线档（偏近期 EMA7 拐头/突破 + 震荡过滤）
+    if not is_choppy and (cross_up or (ema7_up and last_p > ema7 and last_p > prev_p)):
+        reason = (
+            "EMA7 上穿 EMA25 且价格走高，快节奏偏多信号。"
+            if cross_up
+            else "价格站上 EMA7 且 EMA7 向上拐头，快节奏短多信号。"
+        )
+        candidates.append({
             "mode": "快节奏短线",
             "side": "做多 (Long)",
             "badge": "⚡ 快多脉冲",
-            "reason": (
-                "EMA7 向上穿越 EMA25 且最新价走高，短线冲高动能较快，注意控制仓位与止损。"
-                if cross_up
-                else "短线价格站上 EMA7 且 EMA7 向上拐头，适合快进快出盯紧冲高目标。"
-            ),
+            "reason": reason + _rsi_note("做多 (Long)", rsi_val, use_rsi),
             "entry": last_p,
             "sl_pct": 0.7,
             "tp1_pct": 1.0,
             "tp2_pct": 1.8,
-            "can_apply": True,
-        }
-    elif (cross_down or (ema7_down and last_p < ema7 and last_p < prev_p)):
-        fast = {
+        })
+    elif not is_choppy and (cross_down or (ema7_down and last_p < ema7 and last_p < prev_p)):
+        reason = (
+            "EMA7 下穿 EMA25 且价格走弱，快节奏偏空信号。"
+            if cross_down
+            else "价格跌破 EMA7 且 EMA7 向下拐头，快节奏短空信号。"
+        )
+        candidates.append({
             "mode": "快节奏短线",
             "side": "做空 (Short)",
             "badge": "⚡ 快空脉冲",
-            "reason": (
-                "EMA7 向下穿越 EMA25 且最新价走弱，短线回落动能较快，注意防反抽与插针。"
-                if cross_down
-                else "短线价格跌破 EMA7 且 EMA7 向下拐头，适合短平快盯紧回落目标。"
-            ),
+            "reason": reason + _rsi_note("做空 (Short)", rsi_val, use_rsi),
             "entry": last_p,
             "sl_pct": 0.7,
             "tp1_pct": 1.0,
             "tp2_pct": 1.8,
-            "can_apply": True,
-        }
-    else:
-        fast = {
-            "mode": "快节奏短线",
-            "side": "观望 (Wait)",
-            "badge": "⏸️ 短线等拐头",
-            "reason": "最近两根节奏未出现明显的 EMA7 拐头或突破确认，快节奏短线建议先等信号。",
-            "entry": last_p,
-            "sl_pct": 0.7,
-            "tp1_pct": 1.0,
-            "tp2_pct": 1.8,
-            "can_apply": False,
-        }
+        })
 
-    for item in (steady, fast):
-        ep = item["entry"]
+    for item in candidates:
+        ep = float(item["entry"])
         if item["side"].startswith("做多"):
             item["sl_price"] = ep * (1 - item["sl_pct"] / 100)
             item["tp1_price"] = ep * (1 + item["tp1_pct"] / 100)
             item["tp2_price"] = ep * (1 + item["tp2_pct"] / 100)
-        elif item["side"].startswith("做空"):
+        else:
             item["sl_price"] = ep * (1 + item["sl_pct"] / 100)
             item["tp1_price"] = ep * (1 - item["tp1_pct"] / 100)
             item["tp2_price"] = ep * (1 - item["tp2_pct"] / 100)
-        else:
-            item["sl_price"] = None
-            item["tp1_price"] = None
-            item["tp2_price"] = None
 
-    return {"steady": steady, "fast": fast}
+    return candidates
 
 
-def _apply_strategy_to_position(strat: dict, sym_key: str) -> None:
-    if not strat["can_apply"]:
-        return
-    st.session_state["pos_direction"] = strat["side"]
-    st.session_state["pos_entry_price"] = float(round(strat["entry"], 6))
-    st.session_state["pos_sl_pct"] = float(strat["sl_pct"])
-    st.session_state["pos_tp1_pct"] = float(strat["tp1_pct"])
-    st.session_state["pos_tp2_pct"] = float(strat["tp2_pct"])
-    st.toast(f"已将【{strat['mode']} · {strat['side']}】参考参数填入左侧出单提示（{sym_key}）")
+def _sync_strategy_vault(
+    vault_key: str,
+    candidates: list[dict],
+    min_gap_pct: float,
+    max_items: int,
+) -> int:
+    """将符合条件且价格不重复的策略锁定快照存入独立策略区，返回本次新增条数。"""
+    items: list[dict] = list(st.session_state["strategy_vault"].get(vault_key, []))
+    added = 0
+
+    for cand in candidates:
+        cand_entry = float(cand["entry"])
+        is_duplicate = False
+        for existing in items:
+            if existing["mode"] == cand["mode"] and existing["side"] == cand["side"]:
+                prev_entry = float(existing["entry"])
+                if prev_entry > 0:
+                    gap = abs(cand_entry - prev_entry) / prev_entry * 100
+                    if gap < min_gap_pct:
+                        is_duplicate = True
+                        break
+        if not is_duplicate:
+            snapshot = {
+                "id": f"{int(time.time() * 1000)}_{added}_{cand['mode']}",
+                "created_at": time.strftime("%H:%M:%S"),
+                "mode": cand["mode"],
+                "side": cand["side"],
+                "badge": cand["badge"],
+                "reason": cand["reason"],
+                "entry": cand_entry,
+                "sl_pct": float(cand["sl_pct"]),
+                "tp1_pct": float(cand["tp1_pct"]),
+                "tp2_pct": float(cand["tp2_pct"]),
+                "sl_price": float(cand["sl_price"]),
+                "tp1_price": float(cand["tp1_price"]),
+                "tp2_price": float(cand["tp2_price"]),
+            }
+            items.insert(0, snapshot)
+            added += 1
+
+    items = items[:max_items]
+    st.session_state["strategy_vault"][vault_key] = items
+    return added
+
+
+def _apply_snapshot_to_position(snap: dict, sym_key: str) -> None:
+    st.session_state["pos_direction"] = snap["side"]
+    st.session_state["pos_entry_price"] = float(round(float(snap["entry"]), 6))
+    st.session_state["pos_sl_pct"] = float(snap["sl_pct"])
+    st.session_state["pos_tp1_pct"] = float(snap["tp1_pct"])
+    st.session_state["pos_tp2_pct"] = float(snap["tp2_pct"])
+    st.toast(f"已将锁定快照【{snap['mode']} · {snap['side']}】填入左侧出单提示（{sym_key}）")
 
 
 interval_arg = refresh_sec if auto_refresh else None
@@ -354,6 +414,7 @@ interval_arg = refresh_sec if auto_refresh else None
 @st.fragment(run_every=interval_arg)
 def render_live_panel() -> None:
     active_symbol = symbol_input or "BTC/USDT"
+    vault_key = f"{exchange_choice}_{active_symbol}_{timeframe}"
     st.subheader(f"📌 当前选中币种实时卡片（{active_symbol} · {exchange_choice.upper()}）")
 
     try:
@@ -364,11 +425,16 @@ def render_live_panel() -> None:
         ema7_val = float(df["ema7"].iloc[-1])
         prev_ema7 = float(df["ema7"].iloc[-2]) if len(df) > 1 else ema7_val
         ema25_val = float(df["ema25"].iloc[-1])
+        rsi_val = float(df["rsi14"].iloc[-1]) if "rsi14" in df.columns else 50.0
 
         c1, c2, c3, c4 = st.columns(4)
         c1.metric(f"{active_symbol} 最新价", _fmt_price(last_p), f"{chg:+.2f}%")
         c2.metric("EMA7 价格", _fmt_price(ema7_val), f"价差 {last_p - ema7_val:+.4f}")
-        c3.metric("EMA25 价格", _fmt_price(ema25_val), f"价差 {last_p - ema25_val:+.4f}")
+        c3.metric(
+            "EMA25 价格",
+            _fmt_price(ema25_val),
+            f"RSI14 {rsi_val:.1f}" if enable_rsi_assist else f"价差 {last_p - ema25_val:+.4f}",
+        )
         c4.metric(
             "刷新状态",
             f"🟢 每 {refresh_sec}s" if auto_refresh else "⏸️ 已暂停",
@@ -423,53 +489,56 @@ def render_live_panel() -> None:
             else:
                 st.info(advice_text)
 
+        # 独立策略区：锁定快照、震荡过滤 + RSI 辅助、价格接近去重
         st.divider()
-        hdr_col, opt_col = st.columns([3, 1])
-        with hdr_col:
-            st.subheader("🎯 自动短线策略参考（稳健短线 + 快节奏短线）")
-        with opt_col:
-            compact_cards = st.checkbox("收起策略详情", value=False, key="compact_strat_cards")
+        hdr_l, hdr_r = st.columns([4, 1])
+        with hdr_l:
+            st.subheader(f"🎯 独立短线策略区（{active_symbol} · {timeframe} · 锁价去重）")
+        with hdr_r:
+            if st.button("清空本币策略", key=f"clear_vault_{vault_key}", use_container_width=True):
+                st.session_state["strategy_vault"][vault_key] = []
+                st.rerun(scope="fragment")
 
-        dual = _detect_dual_short_strategies(df)
-        sc1, sc2 = st.columns(2)
+        candidates = _evaluate_candidate_strategies(df, use_rsi=enable_rsi_assist)
+        added_cnt = _sync_strategy_vault(
+            vault_key=vault_key,
+            candidates=candidates,
+            min_gap_pct=float(dedup_pct),
+            max_items=int(max_strategy_items),
+        )
+        vault_items = st.session_state["strategy_vault"].get(vault_key, [])
 
-        for col_box, key_name, strat in [
-            (sc1, "steady", dual["steady"]),
-            (sc2, "fast", dual["fast"]),
-        ]:
-            with col_box:
+        status_note = (
+            f"本次新增 {added_cnt} 条策略快照（去重阈值：{dedup_pct:.2f}%；已锁定参考价，不随现价跳动）"
+            if added_cnt > 0
+            else f"当前无新不重复单据（去重阈值：{dedup_pct:.2f}%；已有快照已锁定参考价，不随现价跳动）"
+        )
+        st.caption(status_note)
+
+        if not vault_items:
+            st.info(
+                "当前处于震荡过滤或暂无新信号，独立策略区暂未生成新单据。满足趋势条件且价格拉开间距后会自动出现在这里。"
+            )
+        else:
+            for idx, snap in enumerate(vault_items):
                 with st.container(border=True):
-                    st.markdown(f"**{strat['mode']}** · {strat['badge']}（**{strat['side']}**）")
-                    if not compact_cards:
-                        st.caption(strat["reason"])
-                        m1, m2 = st.columns(2)
-                        m1.write(f"参考入场：**{_fmt_price(strat['entry'])}**")
-                        if strat["sl_price"] is not None:
-                            m2.write(f"参考止损：**{_fmt_price(strat['sl_price'])}** (-{strat['sl_pct']:.1f}%)")
-                            t1, t2 = st.columns(2)
-                            t1.write(f"参考 TP1：**{_fmt_price(strat['tp1_price'])}** (+{strat['tp1_pct']:.1f}%)")
-                            t2.write(f"参考 TP2：**{_fmt_price(strat['tp2_price'])}** (+{strat['tp2_pct']:.1f}%)")
-                        else:
-                            m2.write("参考止损：—")
-                            t1, t2 = st.columns(2)
-                            t1.write("参考 TP1：—")
-                            t2.write("参考 TP2：—")
-
-                    btn_label = (
-                        f"填入「{strat['mode']}」到出单提示"
-                        if strat["can_apply"]
-                        else f"{strat['mode']}当前建议观望"
-                    )
-                    if st.button(
-                        btn_label,
-                        key=f"apply_{key_name}_{active_symbol}",
-                        disabled=not strat["can_apply"],
+                    top_a, top_b, top_c = st.columns([2, 2, 1.4])
+                    top_a.markdown(f"**#{idx + 1} · {snap['mode']}** — {snap['badge']}（**{snap['side']}**）")
+                    top_b.caption(f"锁定时间：{snap['created_at']}（价位已冻结）")
+                    if top_c.button(
+                        "填入出单提示",
+                        key=f"use_snap_{vault_key}_{snap['id']}",
                         use_container_width=True,
                     ):
-                        _apply_strategy_to_position(strat, active_symbol)
+                        _apply_snapshot_to_position(snap, active_symbol)
                         st.rerun()
 
-        st.caption("※ 以上短线策略为均线与价格规则参考，随每次刷新动态更新，不构成自动下单或稳赚承诺。")
+                    st.caption(snap["reason"])
+                    p1, p2, p3, p4 = st.columns(4)
+                    p1.write(f"锁定入场：**{_fmt_price(snap['entry'])}**")
+                    p2.write(f"锁定止损：**{_fmt_price(snap['sl_price'])}** (-{snap['sl_pct']:.1f}%)")
+                    p3.write(f"锁定 TP1：**{_fmt_price(snap['tp1_price'])}** (+{snap['tp1_pct']:.1f}%)")
+                    p4.write(f"锁定 TP2：**{_fmt_price(snap['tp2_price'])}** (+{snap['tp2_pct']:.1f}%)")
 
         st.divider()
         st.subheader(f"📉 {active_symbol} 价格与均线走势（EMA7 / EMA25）")
