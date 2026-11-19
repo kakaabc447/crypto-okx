@@ -1,3 +1,4 @@
+from datetime import datetime, timedelta, timezone
 import time
 import ccxt
 import numpy as np
@@ -35,9 +36,17 @@ elif "/" not in symbol_input and symbol_input:
 timeframe = st.sidebar.selectbox("K线周期", ["1m", "5m", "15m", "1h"], index=1)
 limit = st.sidebar.slider("K线根数", min_value=50, max_value=200, value=120, step=10)
 
-st.sidebar.header("2. 自动刷新")
+st.sidebar.header("2. 自动刷新与时区")
 refresh_sec = st.sidebar.slider("刷新间隔(秒)", min_value=5, max_value=60, value=15, step=5)
 auto_refresh = st.sidebar.checkbox("开启静默自动刷新", value=True)
+tz_offset_hours = st.sidebar.number_input(
+    "显示时区 (UTC偏移小时)",
+    min_value=-12,
+    max_value=14,
+    value=8,
+    step=1,
+    help="默认 UTC+8（北京时间），如遇时间偏差可按所在时区调整",
+)
 
 st.sidebar.header("3. 策略过滤与去重")
 enable_rsi_assist = st.sidebar.checkbox("启用 RSI(14) 辅助提示", value=True)
@@ -56,6 +65,8 @@ if "strategy_vault" not in st.session_state:
     st.session_state["strategy_vault"] = {}
 if "global_strategy_history" not in st.session_state:
     st.session_state["global_strategy_history"] = []
+if "active_view" not in st.session_state:
+    st.session_state["active_view"] = "live"
 
 st.sidebar.header("4. 持仓与出单提示")
 direction = st.sidebar.selectbox("持仓方向", ["做多 (Long)", "做空 (Short)"], index=0)
@@ -63,6 +74,22 @@ entry_price = st.sidebar.number_input("开仓均价", min_value=0.0, value=0.0, 
 sl_pct = st.sidebar.number_input("止损幅度 (%)", min_value=0.1, max_value=20.0, value=1.0, step=0.1, format="%.2f")
 tp1_pct = st.sidebar.number_input("第一止盈 TP1 (%)", min_value=0.2, max_value=30.0, value=1.5, step=0.1, format="%.2f")
 tp2_pct = st.sidebar.number_input("第二止盈 TP2 (%)", min_value=0.5, max_value=50.0, value=3.0, step=0.1, format="%.2f")
+
+st.sidebar.divider()
+st.sidebar.header("5. 视图切换")
+if st.session_state["active_view"] == "live":
+    if st.sidebar.button("📜 查看历史策略页", key="btn_to_history", use_container_width=True):
+        st.session_state["active_view"] = "history"
+        st.rerun()
+else:
+    if st.sidebar.button("⚡ 返回实时盯盘", key="btn_to_live", use_container_width=True):
+        st.session_state["active_view"] = "live"
+        st.rerun()
+
+
+def _now_tz_str(offset_hours: int) -> str:
+    tz = timezone(timedelta(hours=int(offset_hours)))
+    return datetime.now(tz).strftime("%H:%M:%S")
 
 
 def _fmt_price(val: float) -> str:
@@ -390,6 +417,20 @@ def _evaluate_candidate_strategies(df: pd.DataFrame, coin_short: str, tf: str, u
     return candidates
 
 
+def _upsert_global_history(record: dict, max_global_items: int = 50) -> None:
+    """按快照 ID 更新或插入全局历史记录，让 TP1 / TP2 / 止损到达时间也能在历史页看到。"""
+    global_items: list[dict] = list(st.session_state["global_strategy_history"])
+    replaced = False
+    for i, item in enumerate(global_items):
+        if item.get("id") == record.get("id"):
+            global_items[i] = record
+            replaced = True
+            break
+    if not replaced:
+        global_items.insert(0, record)
+    st.session_state["global_strategy_history"] = global_items[:max_global_items]
+
+
 def _sync_strategy_vault(
     vault_key: str,
     ex_name: str,
@@ -398,11 +439,10 @@ def _sync_strategy_vault(
     candidates: list[dict],
     min_gap_pct: float,
     max_items: int,
-    max_global_items: int = 25,
+    tz_offset: int,
 ) -> int:
     """将符合条件且价格不重复的策略锁定快照存入独立策略区与全局历史记录，返回本次新增条数。"""
     items: list[dict] = list(st.session_state["strategy_vault"].get(vault_key, []))
-    global_items: list[dict] = list(st.session_state["global_strategy_history"])
     added = 0
 
     for cand in candidates:
@@ -417,11 +457,14 @@ def _sync_strategy_vault(
                         is_duplicate = True
                         break
         if not is_duplicate:
-            now_str = time.strftime("%H:%M:%S")
+            now_str = _now_tz_str(tz_offset)
             snap_id = f"{int(time.time() * 1000)}_{added}_{cand['mode']}"
             snapshot = {
                 "id": snap_id,
                 "created_at": now_str,
+                "ex": ex_name.upper(),
+                "coin": coin_short,
+                "tf": tf,
                 "mode": cand["mode"],
                 "side": cand["side"],
                 "badge": cand["badge"],
@@ -441,26 +484,17 @@ def _sync_strategy_vault(
                 "hit_sl_at": None,
             }
             items.insert(0, snapshot)
-            global_items.insert(0, {
-                "id": snap_id,
-                "time": now_str,
-                "ex": ex_name.upper(),
-                "coin": coin_short,
-                "tf": tf,
-                "badge": cand["badge"],
-                "entry": cand_entry,
-            })
+            _upsert_global_history(dict(snapshot))
             added += 1
 
     items = items[:max_items]
     st.session_state["strategy_vault"][vault_key] = items
-    st.session_state["global_strategy_history"] = global_items[:max_global_items]
     return added
 
 
-def _update_snapshot_hit_times(items: list[dict], last_p: float) -> list[dict]:
-    """根据当前最新价记录快照首次到达止损 / TP1 / TP2 的时间。"""
-    now_str = time.strftime("%H:%M:%S")
+def _update_snapshot_hit_times(items: list[dict], last_p: float, tz_offset: int) -> list[dict]:
+    """根据当前最新价记录快照首次到达止损 / TP1 / TP2 的时间，并同步到全局历史。"""
+    now_str = _now_tz_str(tz_offset)
     for snap in items:
         is_long = str(snap.get("side", "")).startswith("做多")
         sl_p = float(snap.get("sl_price", 0.0))
@@ -481,6 +515,7 @@ def _update_snapshot_hit_times(items: list[dict], last_p: float) -> list[dict]:
                 snap["hit_tp2_at"] = now_str
             if sl_p > 0 and last_p >= sl_p and not snap.get("hit_sl_at"):
                 snap["hit_sl_at"] = now_str
+        _upsert_global_history(dict(snap))
     return items
 
 
@@ -489,223 +524,250 @@ def _delete_snapshot(vault_key: str, snap_id: str) -> None:
     st.session_state["strategy_vault"][vault_key] = [x for x in items if x["id"] != snap_id]
 
 
-interval_arg = refresh_sec if auto_refresh else None
+def render_history_view() -> None:
+    h_left, h_right = st.columns([4, 1])
+    with h_left:
+        st.subheader("📜 历史策略页（全币种/全周期快照汇总）")
+    with h_right:
+        if st.button("清空历史记录", key="clear_history_page", use_container_width=True):
+            st.session_state["global_strategy_history"] = []
+            st.rerun()
 
+    hist_items: list[dict] = list(st.session_state.get("global_strategy_history", []))
+    st.caption(f"当前已汇总 {len(hist_items)} 条历史策略快照（UTC{int(tz_offset_hours):+d} 时间；点左侧“返回实时盯盘”可切回主界面）")
 
-@st.fragment(run_every=interval_arg)
-def render_live_panel() -> None:
-    active_symbol = symbol_input or "BTC/USDT"
-    coin_short = active_symbol.split("/")[0]
-    vault_key = f"{exchange_choice}_{active_symbol}_{timeframe}"
-    st.subheader(f"📌 当前选中币种实时卡片（{active_symbol} · {exchange_choice.upper()}）")
+    if not hist_items:
+        st.info("暂无历史策略记录。回到实时盯盘后，生成的新策略快照会自动汇总到这里。")
+        return
 
-    try:
-        df = fetch_ohlcv_by_exchange(exchange_choice, active_symbol, timeframe, limit)
-        last_p = float(df["close"].iloc[-1])
-        prev_p = float(df["close"].iloc[-2]) if len(df) > 1 else last_p
-        chg = ((last_p - prev_p) / prev_p) * 100 if prev_p else 0.0
-        ema7_val = float(df["ema7"].iloc[-1])
-        prev_ema7 = float(df["ema7"].iloc[-2]) if len(df) > 1 else ema7_val
-        ema25_val = float(df["ema25"].iloc[-1])
-        rsi_val = float(df["rsi14"].iloc[-1]) if "rsi14" in df.columns else 50.0
-
-        c1, c2, c3, c4 = st.columns(4)
-        c1.metric(f"{active_symbol} 最新价", _fmt_price(last_p), f"{chg:+.2f}%")
-        c2.metric("EMA7 价格", _fmt_price(ema7_val), f"价差 {last_p - ema7_val:+.4f}")
-        c3.metric(
-            "EMA25 价格",
-            _fmt_price(ema25_val),
-            f"RSI14 {rsi_val:.1f}" if enable_rsi_assist else f"价差 {last_p - ema25_val:+.4f}",
-        )
-        c4.metric(
-            "刷新状态",
-            f"🟢 每 {refresh_sec}s" if auto_refresh else "⏸️ 已暂停",
-            f"{exchange_choice.upper()} · {timeframe}",
-        )
-
-        if entry_price > 0:
-            st.divider()
-            st.subheader("🚪 出单参考（止损 / TP1 / TP2 与动态建议）")
-            is_long = direction.startswith("做多")
-            if is_long:
-                pnl = ((last_p - entry_price) / entry_price) * 100
-                sl_p = entry_price * (1 - sl_pct / 100)
-                tp1_p = entry_price * (1 + tp1_pct / 100)
-                tp2_p = entry_price * (1 + tp2_pct / 100)
-                hit_sl = last_p <= sl_p
-                hit_tp2 = last_p >= tp2_p
-                hit_tp1 = last_p >= tp1_p
-            else:
-                pnl = ((entry_price - last_p) / entry_price) * 100
-                sl_p = entry_price * (1 + sl_pct / 100)
-                tp1_p = entry_price * (1 - tp1_pct / 100)
-                tp2_p = entry_price * (1 - tp2_pct / 100)
-                hit_sl = last_p >= sl_p
-                hit_tp2 = last_p <= tp2_p
-                hit_tp1 = last_p <= tp1_p
-
-            k1, k2, k3, k4 = st.columns(4)
-            k1.metric("当前浮盈亏", f"{pnl:+.2f}%")
-            k2.metric("止损价", _fmt_price(sl_p))
-            k3.metric("TP1 价", _fmt_price(tp1_p))
-            k4.metric("TP2 价", _fmt_price(tp2_p))
-
-            level, advice_text = _build_dynamic_advice(
-                is_long=is_long,
-                pnl=pnl,
-                last_p=last_p,
-                prev_p=prev_p,
-                ema7_val=ema7_val,
-                prev_ema7=prev_ema7,
-                ema25_val=ema25_val,
-                hit_sl=hit_sl,
-                hit_tp1=hit_tp1,
-                hit_tp2=hit_tp2,
+    for idx, item in enumerate(hist_items):
+        with st.container(border=True):
+            top_1, top_2 = st.columns([3, 1.5])
+            top_1.markdown(
+                f"**#{idx + 1} · {item.get('coin', '')} ({item.get('tf', '')})** — "
+                f"{item.get('badge', '')}（**{item.get('side', '')}**）"
             )
-            if level == "error":
-                st.error(advice_text)
-            elif level == "success":
-                st.success(advice_text)
-            elif level == "warning":
-                st.warning(advice_text)
-            else:
-                st.info(advice_text)
+            top_2.caption(f"锁定时间：{item.get('created_at', '--')} · {item.get('ex', '')}")
 
-        # 独立策略区：锁定快照、震荡过滤 + RSI 辅助、价格接近去重、单条删除、提前失效预警、到达时间记录
-        st.divider()
-        hdr_l, hdr_r = st.columns([4, 1])
-        with hdr_l:
-            st.subheader(f"🎯 独立短线策略区（{active_symbol} · {timeframe} · 锁价去重）")
-        with hdr_r:
-            if st.button("清空本币策略", key=f"clear_vault_{vault_key}", use_container_width=True):
-                st.session_state["strategy_vault"][vault_key] = []
-                st.rerun(scope="fragment")
+            p1, p2, p3, p4 = st.columns(4)
+            p1.write(f"锁定入场：**{_fmt_price(float(item.get('entry', 0.0)))}**")
+            p2.write(f"锁定止损：**{_fmt_price(float(item.get('sl_price', 0.0)))}**")
+            p3.write(f"锁定 TP1：**{_fmt_price(float(item.get('tp1_price', 0.0)))}**")
+            p4.write(f"锁定 TP2：**{_fmt_price(float(item.get('tp2_price', 0.0)))}**")
 
-        candidates = _evaluate_candidate_strategies(df, coin_short=coin_short, tf=timeframe, use_rsi=enable_rsi_assist)
-        added_cnt = _sync_strategy_vault(
-            vault_key=vault_key,
-            ex_name=exchange_choice,
-            coin_short=coin_short,
-            tf=timeframe,
-            candidates=candidates,
-            min_gap_pct=float(dedup_pct),
-            max_items=int(max_strategy_items),
-        )
-        vault_items = _update_snapshot_hit_times(
-            list(st.session_state["strategy_vault"].get(vault_key, [])),
-            last_p=last_p,
-        )
-        st.session_state["strategy_vault"][vault_key] = vault_items
-
-        status_note = (
-            f"本次新增 {added_cnt} 条策略快照（去重阈值：{dedup_pct:.2f}%；已锁定参考价，不随现价跳动）"
-            if added_cnt > 0
-            else f"当前无新不重复单据（去重阈值：{dedup_pct:.2f}%；已有快照已锁定参考价，不随现价跳动）"
-        )
-        st.caption(status_note)
-
-        if not vault_items:
-            st.info(
-                "当前处于震荡过滤或暂无新信号，独立策略区暂未生成新单据。满足趋势条件且价格拉开间距后会自动出现在这里。"
-            )
-        else:
-            for idx, snap in enumerate(vault_items):
-                with st.container(border=True):
-                    top_a, top_b, top_c = st.columns([2.4, 1.8, 0.9])
-                    top_a.markdown(f"**#{idx + 1} · {snap['mode']}** — {snap['badge']}（**{snap['side']}**）")
-                    top_b.caption(f"锁定时间：{snap['created_at']}（价位已冻结）")
-                    if top_c.button(
-                        "删除",
-                        key=f"del_snap_{vault_key}_{snap['id']}",
-                        use_container_width=True,
-                    ):
-                        _delete_snapshot(vault_key, snap["id"])
-                        st.rerun(scope="fragment")
-
-                    st.caption(snap["reason"])
-                    p1, p2, p3, p4 = st.columns(4)
-                    p1.write(f"锁定入场：**{_fmt_price(snap['entry'])}**")
-                    p2.write(f"锁定止损：**{_fmt_price(snap['sl_price'])}** (-{snap['sl_pct']:.1f}%)")
-                    p3.write(f"锁定 TP1：**{_fmt_price(snap['tp1_price'])}** (+{snap['tp1_pct']:.1f}%)")
-                    p4.write(f"锁定 TP2：**{_fmt_price(snap['tp2_price'])}** (+{snap['tp2_pct']:.1f}%)")
-
-                    t1, t2, t3 = st.columns(3)
-                    t1.caption(f"到 TP1 时间：{snap.get('hit_tp1_at') or '未到达'}")
-                    t2.caption(f"到 TP2 时间：{snap.get('hit_tp2_at') or '未到达'}")
-                    t3.caption(f"到止损时间：{snap.get('hit_sl_at') or '未到达'}")
-
-                    inv_p = float(snap.get("invalid_price", 0.0))
-                    inv_dir = snap.get("invalid_dir", "")
-                    inv_text = snap.get("invalid_text", "")
-                    if inv_text and inv_p > 0:
-                        triggered = (inv_dir == "below" and last_p < inv_p) or (inv_dir == "above" and last_p > inv_p)
-                        if triggered:
-                            st.warning(f"🚨 已越过提前失效线（现价 {_fmt_price(last_p)}）—— {inv_text}")
-                        else:
-                            st.caption(f"🛡️ {inv_text}")
-
-        st.divider()
-        st.subheader(f"📉 {active_symbol} 价格与均线走势（EMA7 / EMA25）")
-
-        fig = go.Figure(
-            data=[
-                go.Candlestick(
-                    x=df["time"],
-                    open=df["open"],
-                    high=df["high"],
-                    low=df["low"],
-                    close=df["close"],
-                    name="K线",
-                ),
-                go.Scatter(
-                    x=df["time"],
-                    y=df["ema7"],
-                    mode="lines",
-                    name=f"EMA7 ({_fmt_price(ema7_val)})",
-                    line=dict(width=1.4),
-                ),
-                go.Scatter(
-                    x=df["time"],
-                    y=df["ema25"],
-                    mode="lines",
-                    name=f"EMA25 ({_fmt_price(ema25_val)})",
-                    line=dict(width=1.4),
-                ),
-            ]
-        )
-        fig.update_layout(
-            height=380,
-            margin=dict(l=10, r=10, t=20, b=10),
-            xaxis_rangeslider_visible=False,
-            hovermode="x unified",
-        )
-        st.plotly_chart(fig, use_container_width=True)
-        st.caption(
-            f"{exchange_choice.upper()} · {active_symbol} · {timeframe}（{len(df)} 根）｜"
-            f"最新 EMA7: {_fmt_price(ema7_val)} ｜最新 EMA25: {_fmt_price(ema25_val)}（点按或悬停 K 线可看各时点均线价格）"
-        )
-
-    except Exception as e:
-        st.error(f"行情加载失败：{e}")
-
-    if st.button("立即刷新"):
-        st.cache_data.clear()
-        st.rerun(scope="fragment")
+            t1, t2, t3 = st.columns(3)
+            t1.caption(f"到 TP1 时间：{item.get('hit_tp1_at') or '未到达'}")
+            t2.caption(f"到 TP2 时间：{item.get('hit_tp2_at') or '未到达'}")
+            t3.caption(f"到止损时间：{item.get('hit_sl_at') or '未到达'}")
 
 
-render_live_panel()
-
-# 左侧边栏：全局历史策略区（简略记录所有生成的策略）
-st.sidebar.divider()
-st.sidebar.header("5. 全局历史策略区")
-hist_items = st.session_state.get("global_strategy_history", [])
-if hist_items:
-    if st.sidebar.button("清空全局历史", key="clear_global_history", use_container_width=True):
-        st.session_state["global_strategy_history"] = []
-        st.rerun()
-    for g_item in hist_items:
-        st.sidebar.caption(
-            f"{g_item['time']} · {g_item['coin']} {g_item['tf']} · {g_item['badge']} @ {_fmt_price(float(g_item['entry']))}"
-        )
+if st.session_state["active_view"] == "history":
+    render_history_view()
 else:
-    st.sidebar.caption("暂无历史策略记录，新快照生成后会自动汇总到这里。")
+    interval_arg = refresh_sec if auto_refresh else None
+
+    @st.fragment(run_every=interval_arg)
+    def render_live_panel() -> None:
+        active_symbol = symbol_input or "BTC/USDT"
+        coin_short = active_symbol.split("/")[0]
+        vault_key = f"{exchange_choice}_{active_symbol}_{timeframe}"
+        st.subheader(f"📌 当前选中币种实时卡片（{active_symbol} · {exchange_choice.upper()}）")
+
+        try:
+            df = fetch_ohlcv_by_exchange(exchange_choice, active_symbol, timeframe, limit)
+            last_p = float(df["close"].iloc[-1])
+            prev_p = float(df["close"].iloc[-2]) if len(df) > 1 else last_p
+            chg = ((last_p - prev_p) / prev_p) * 100 if prev_p else 0.0
+            ema7_val = float(df["ema7"].iloc[-1])
+            prev_ema7 = float(df["ema7"].iloc[-2]) if len(df) > 1 else ema7_val
+            ema25_val = float(df["ema25"].iloc[-1])
+            rsi_val = float(df["rsi14"].iloc[-1]) if "rsi14" in df.columns else 50.0
+
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric(f"{active_symbol} 最新价", _fmt_price(last_p), f"{chg:+.2f}%")
+            c2.metric("EMA7 价格", _fmt_price(ema7_val), f"价差 {last_p - ema7_val:+.4f}")
+            c3.metric(
+                "EMA25 价格",
+                _fmt_price(ema25_val),
+                f"RSI14 {rsi_val:.1f}" if enable_rsi_assist else f"价差 {last_p - ema25_val:+.4f}",
+            )
+            c4.metric(
+                "刷新状态",
+                f"🟢 每 {refresh_sec}s" if auto_refresh else "⏸️ 已暂停",
+                f"{exchange_choice.upper()} · {timeframe}",
+            )
+
+            if entry_price > 0:
+                st.divider()
+                st.subheader("🚪 出单参考（止损 / TP1 / TP2 与动态建议）")
+                is_long = direction.startswith("做多")
+                if is_long:
+                    pnl = ((last_p - entry_price) / entry_price) * 100
+                    sl_p = entry_price * (1 - sl_pct / 100)
+                    tp1_p = entry_price * (1 + tp1_pct / 100)
+                    tp2_p = entry_price * (1 + tp2_pct / 100)
+                    hit_sl = last_p <= sl_p
+                    hit_tp2 = last_p >= tp2_p
+                    hit_tp1 = last_p >= tp1_p
+                else:
+                    pnl = ((entry_price - last_p) / entry_price) * 100
+                    sl_p = entry_price * (1 + sl_pct / 100)
+                    tp1_p = entry_price * (1 - tp1_pct / 100)
+                    tp2_p = entry_price * (1 - tp2_pct / 100)
+                    hit_sl = last_p >= sl_p
+                    hit_tp2 = last_p <= tp2_p
+                    hit_tp1 = last_p <= tp1_p
+
+                k1, k2, k3, k4 = st.columns(4)
+                k1.metric("当前浮盈亏", f"{pnl:+.2f}%")
+                k2.metric("止损价", _fmt_price(sl_p))
+                k3.metric("TP1 价", _fmt_price(tp1_p))
+                k4.metric("TP2 价", _fmt_price(tp2_p))
+
+                level, advice_text = _build_dynamic_advice(
+                    is_long=is_long,
+                    pnl=pnl,
+                    last_p=last_p,
+                    prev_p=prev_p,
+                    ema7_val=ema7_val,
+                    prev_ema7=prev_ema7,
+                    ema25_val=ema25_val,
+                    hit_sl=hit_sl,
+                    hit_tp1=hit_tp1,
+                    hit_tp2=hit_tp2,
+                )
+                if level == "error":
+                    st.error(advice_text)
+                elif level == "success":
+                    st.success(advice_text)
+                elif level == "warning":
+                    st.warning(advice_text)
+                else:
+                    st.info(advice_text)
+
+            # 独立策略区：锁定快照、震荡过滤 + RSI 辅助、价格接近去重、单条删除、提前失效预警、到达时间记录
+            st.divider()
+            hdr_l, hdr_r = st.columns([4, 1])
+            with hdr_l:
+                st.subheader(f"🎯 独立短线策略区（{active_symbol} · {timeframe} · 锁价去重）")
+            with hdr_r:
+                if st.button("清空本币策略", key=f"clear_vault_{vault_key}", use_container_width=True):
+                    st.session_state["strategy_vault"][vault_key] = []
+                    st.rerun(scope="fragment")
+
+            candidates = _evaluate_candidate_strategies(
+                df, coin_short=coin_short, tf=timeframe, use_rsi=enable_rsi_assist
+            )
+            added_cnt = _sync_strategy_vault(
+                vault_key=vault_key,
+                ex_name=exchange_choice,
+                coin_short=coin_short,
+                tf=timeframe,
+                candidates=candidates,
+                min_gap_pct=float(dedup_pct),
+                max_items=int(max_strategy_items),
+                tz_offset=int(tz_offset_hours),
+            )
+            vault_items = _update_snapshot_hit_times(
+                list(st.session_state["strategy_vault"].get(vault_key, [])),
+                last_p=last_p,
+                tz_offset=int(tz_offset_hours),
+            )
+            st.session_state["strategy_vault"][vault_key] = vault_items
+
+            status_note = (
+                f"本次新增 {added_cnt} 条策略快照（去重阈值：{dedup_pct:.2f}%；已锁定参考价，不随现价跳动）"
+                if added_cnt > 0
+                else f"当前无新不重复单据（去重阈值：{dedup_pct:.2f}%；已有快照已锁定参考价，不随现价跳动）"
+            )
+            st.caption(status_note)
+
+            if not vault_items:
+                st.info(
+                    "当前处于震荡过滤或暂无新信号，独立策略区暂未生成新单据。满足趋势条件且价格拉开间距后会自动出现在这里。"
+                )
+            else:
+                for idx, snap in enumerate(vault_items):
+                    with st.container(border=True):
+                        top_a, top_b, top_c = st.columns([2.4, 1.8, 0.9])
+                        top_a.markdown(f"**#{idx + 1} · {snap['mode']}** — {snap['badge']}（**{snap['side']}**）")
+                        top_b.caption(f"锁定时间：{snap['created_at']}（价位已冻结）")
+                        if top_c.button(
+                            "删除",
+                            key=f"del_snap_{vault_key}_{snap['id']}",
+                            use_container_width=True,
+                        ):
+                            _delete_snapshot(vault_key, snap["id"])
+                            st.rerun(scope="fragment")
+
+                        st.caption(snap["reason"])
+                        p1, p2, p3, p4 = st.columns(4)
+                        p1.write(f"锁定入场：**{_fmt_price(snap['entry'])}**")
+                        p2.write(f"锁定止损：**{_fmt_price(snap['sl_price'])}** (-{snap['sl_pct']:.1f}%)")
+                        p3.write(f"锁定 TP1：**{_fmt_price(snap['tp1_price'])}** (+{snap['tp1_pct']:.1f}%)")
+                        p4.write(f"锁定 TP2：**{_fmt_price(snap['tp2_price'])}** (+{snap['tp2_pct']:.1f}%)")
+
+                        t1, t2, t3 = st.columns(3)
+                        t1.caption(f"到 TP1 时间：{snap.get('hit_tp1_at') or '未到达'}")
+                        t2.caption(f"到 TP2 时间：{snap.get('hit_tp2_at') or '未到达'}")
+                        t3.caption(f"到止损时间：{snap.get('hit_sl_at') or '未到达'}")
+
+                        inv_p = float(snap.get("invalid_price", 0.0))
+                        inv_dir = snap.get("invalid_dir", "")
+                        inv_text = snap.get("invalid_text", "")
+                        if inv_text and inv_p > 0:
+                            triggered = (inv_dir == "below" and last_p < inv_p) or (inv_dir == "above" and last_p > inv_p)
+                            if triggered:
+                                st.warning(f"🚨 已越过提前失效线（现价 {_fmt_price(last_p)}）—— {inv_text}")
+                            else:
+                                st.caption(f"🛡️ {inv_text}")
+
+            st.divider()
+            st.subheader(f"📉 {active_symbol} 价格与均线走势（EMA7 / EMA25）")
+
+            fig = go.Figure(
+                data=[
+                    go.Candlestick(
+                        x=df["time"],
+                        open=df["open"],
+                        high=df["high"],
+                        low=df["low"],
+                        close=df["close"],
+                        name="K线",
+                    ),
+                    go.Scatter(
+                        x=df["time"],
+                        y=df["ema7"],
+                        mode="lines",
+                        name=f"EMA7 ({_fmt_price(ema7_val)})",
+                        line=dict(width=1.4),
+                    ),
+                    go.Scatter(
+                        x=df["time"],
+                        y=df["ema25"],
+                        mode="lines",
+                        name=f"EMA25 ({_fmt_price(ema25_val)})",
+                        line=dict(width=1.4),
+                    ),
+                ]
+            )
+            fig.update_layout(
+                height=380,
+                margin=dict(l=10, r=10, t=20, b=10),
+                xaxis_rangeslider_visible=False,
+                hovermode="x unified",
+            )
+            st.plotly_chart(fig, use_container_width=True)
+            st.caption(
+                f"{exchange_choice.upper()} · {active_symbol} · {timeframe}（{len(df)} 根）｜"
+                f"最新 EMA7: {_fmt_price(ema7_val)} ｜最新 EMA25: {_fmt_price(ema25_val)}（点按或悬停 K 线可看各时点均线价格）"
+            )
+
+        except Exception as e:
+            st.error(f"行情加载失败：{e}")
+
+        if st.button("立即刷新"):
+            st.cache_data.clear()
+            st.rerun(scope="fragment")
+
+    render_live_panel()
