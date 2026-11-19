@@ -8,6 +8,59 @@ import requests
 import streamlit as st
 
 st.set_page_config(page_title="WEEX / OKX / Gate 实时合约盯盘", layout="wide")
+
+st.markdown(
+    """
+    <style>
+    @media (max-width: 640px) {
+        .block-container {
+            padding-top: 2.2rem !important;
+            padding-left: 0.75rem !important;
+            padding-right: 0.75rem !important;
+            padding-bottom: 2rem !important;
+        }
+        h1 {
+            font-size: 1.35rem !important;
+            line-height: 1.3 !important;
+            margin-bottom: 0.4rem !important;
+        }
+        h2, h3 {
+            font-size: 1.05rem !important;
+            line-height: 1.3 !important;
+            margin-top: 0.35rem !important;
+            margin-bottom: 0.35rem !important;
+        }
+        [data-testid="stHorizontalBlock"]:has([data-testid="stMetric"]) {
+            display: flex !important;
+            flex-wrap: wrap !important;
+            gap: 0.45rem !important;
+        }
+        [data-testid="stHorizontalBlock"]:has([data-testid="stMetric"]) > [data-testid="column"] {
+            flex: 0 0 calc(50% - 0.25rem) !important;
+            width: calc(50% - 0.25rem) !important;
+            min-width: calc(50% - 0.25rem) !important;
+            padding: 0 !important;
+        }
+        [data-testid="stMetric"] {
+            background: rgba(128, 128, 128, 0.06);
+            border-radius: 8px;
+            padding: 0.45rem 0.55rem !important;
+        }
+        [data-testid="stMetricLabel"] {
+            font-size: 0.75rem !important;
+        }
+        [data-testid="stMetricValue"] {
+            font-size: 1.05rem !important;
+        }
+        [data-testid="stMetricDelta"] {
+            font-size: 0.72rem !important;
+        }
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
 st.title("⚡ WEEX / OKX / Gate 实时盯盘与出单参考")
 
 # 侧边栏：交易所、选币与刷新设置
