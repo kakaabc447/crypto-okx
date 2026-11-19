@@ -12,7 +12,7 @@ st.set_page_config(page_title="WEEX / OKX / Gate 实时合约盯盘", layout="wi
 st.markdown(
     """
     <style>
-    @media (max-width: 640px) {
+    @media (max-width: 768px) {
         .block-container {
             padding-top: 2.2rem !important;
             padding-left: 0.75rem !important;
@@ -30,29 +30,34 @@ st.markdown(
             margin-top: 0.35rem !important;
             margin-bottom: 0.35rem !important;
         }
-        [data-testid="stHorizontalBlock"]:has([data-testid="stMetric"]) {
-            display: flex !important;
-            flex-wrap: wrap !important;
+        div[data-testid="stHorizontalBlock"]:has(div[data-testid="stMetric"]),
+        div[data-testid="stHorizontalBlock"]:has(div[data-testid="stMetricDelta"]) {
+            display: grid !important;
+            grid-template-columns: repeat(2, minmax(0, 1fr)) !important;
             gap: 0.45rem !important;
+            align-items: stretch !important;
         }
-        [data-testid="stHorizontalBlock"]:has([data-testid="stMetric"]) > [data-testid="column"] {
-            flex: 0 0 calc(50% - 0.25rem) !important;
-            width: calc(50% - 0.25rem) !important;
-            min-width: calc(50% - 0.25rem) !important;
+        div[data-testid="stHorizontalBlock"]:has(div[data-testid="stMetric"]) > div[data-testid="column"],
+        div[data-testid="stHorizontalBlock"]:has(div[data-testid="stMetricDelta"]) > div[data-testid="column"] {
+            width: 100% !important;
+            min-width: 0 !important;
+            max-width: 100% !important;
+            flex: none !important;
             padding: 0 !important;
         }
-        [data-testid="stMetric"] {
+        div[data-testid="stMetric"] {
+            height: 100% !important;
             background: rgba(128, 128, 128, 0.06);
             border-radius: 8px;
             padding: 0.45rem 0.55rem !important;
         }
-        [data-testid="stMetricLabel"] {
+        div[data-testid="stMetricLabel"] {
             font-size: 0.75rem !important;
         }
-        [data-testid="stMetricValue"] {
+        div[data-testid="stMetricValue"] {
             font-size: 1.05rem !important;
         }
-        [data-testid="stMetricDelta"] {
+        div[data-testid="stMetricDelta"] {
             font-size: 0.72rem !important;
         }
     }
