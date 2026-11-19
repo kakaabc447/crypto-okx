@@ -52,34 +52,15 @@ dedup_pct = st.sidebar.number_input(
 )
 max_strategy_items = st.sidebar.slider("最多保留策略条数", min_value=3, max_value=15, value=6, step=1)
 
-# 持仓与出单提示状态初始化（支持一键填入短线参考）
-for k, default_v in [
-    ("pos_direction", "做多 (Long)"),
-    ("pos_entry_price", 0.0),
-    ("pos_sl_pct", 1.0),
-    ("pos_tp1_pct", 1.5),
-    ("pos_tp2_pct", 3.0),
-]:
-    if k not in st.session_state:
-        st.session_state[k] = default_v
-
 if "strategy_vault" not in st.session_state:
     st.session_state["strategy_vault"] = {}
 
 st.sidebar.header("4. 持仓与出单提示")
-direction = st.sidebar.selectbox("持仓方向", ["做多 (Long)", "做空 (Short)"], key="pos_direction")
-entry_price = st.sidebar.number_input(
-    "开仓均价", min_value=0.0, step=0.1, format="%.4f", key="pos_entry_price"
-)
-sl_pct = st.sidebar.number_input(
-    "止损幅度 (%)", min_value=0.1, max_value=20.0, step=0.1, format="%.2f", key="pos_sl_pct"
-)
-tp1_pct = st.sidebar.number_input(
-    "第一止盈 TP1 (%)", min_value=0.2, max_value=30.0, step=0.1, format="%.2f", key="pos_tp1_pct"
-)
-tp2_pct = st.sidebar.number_input(
-    "第二止盈 TP2 (%)", min_value=0.5, max_value=50.0, step=0.1, format="%.2f", key="pos_tp2_pct"
-)
+direction = st.sidebar.selectbox("持仓方向", ["做多 (Long)", "做空 (Short)"], index=0)
+entry_price = st.sidebar.number_input("开仓均价", min_value=0.0, value=0.0, step=0.1, format="%.4f")
+sl_pct = st.sidebar.number_input("止损幅度 (%)", min_value=0.1, max_value=20.0, value=1.0, step=0.1, format="%.2f")
+tp1_pct = st.sidebar.number_input("第一止盈 TP1 (%)", min_value=0.2, max_value=30.0, value=1.5, step=0.1, format="%.2f")
+tp2_pct = st.sidebar.number_input("第二止盈 TP2 (%)", min_value=0.5, max_value=50.0, value=3.0, step=0.1, format="%.2f")
 
 
 def _fmt_price(val: float) -> str:
@@ -246,7 +227,41 @@ def _rsi_note(side: str, rsi_val: float, use_rsi: bool) -> str:
     return f"｜RSI(14)={rsi_val:.1f}"
 
 
-def _evaluate_candidate_strategies(df: pd.DataFrame, use_rsi: bool) -> list[dict]:
+def _build_early_invalid_line(
+    is_long: bool,
+    coin_short: str,
+    tf: str,
+    entry_p: float,
+    sl_p: float,
+    ema25_p: float,
+    recent_low: float,
+    recent_high: float,
+) -> tuple[float, str, str]:
+    """根据均线或近期结构高低点生成提前失效线（放在硬止损之前）。"""
+    if is_long:
+        # 候选为出单时 EMA25 与近 6 根低点，挑出位于硬止损上方且低于入场价的结构位
+        candidates = [p for p in (ema25_p, recent_low) if sl_p < p < entry_p]
+        if candidates:
+            inv_p = max(candidates)
+            label = "EMA25 均线位" if abs(inv_p - ema25_p) <= abs(inv_p - recent_low) else "近期低点结构位"
+        else:
+            inv_p = sl_p + (entry_p - sl_p) * 0.45
+            label = "结构过渡位"
+        msg = f"提前预警：若 {coin_short} {tf} 跌破 {_fmt_price(inv_p)}（{label}），多头结构走弱，此策略提前失效（未到硬止损先防）。"
+        return (inv_p, "below", msg)
+    else:
+        candidates = [p for p in (ema25_p, recent_high) if entry_p < p < sl_p]
+        if candidates:
+            inv_p = min(candidates)
+            label = "EMA25 均线位" if abs(inv_p - ema25_p) <= abs(inv_p - recent_high) else "近期高点结构位"
+        else:
+            inv_p = sl_p - (sl_p - entry_p) * 0.45
+            label = "结构过渡位"
+        msg = f"提前预警：若 {coin_short} {tf} 站稳 {_fmt_price(inv_p)}（{label}），空头结构走弱，此策略提前失效（未到硬止损先防）。"
+        return (inv_p, "above", msg)
+
+
+def _evaluate_candidate_strategies(df: pd.DataFrame, coin_short: str, tf: str, use_rsi: bool) -> list[dict]:
     last_p = float(df["close"].iloc[-1])
     prev_p = float(df["close"].iloc[-2]) if len(df) > 1 else last_p
     ema7 = float(df["ema7"].iloc[-1])
@@ -257,9 +272,13 @@ def _evaluate_candidate_strategies(df: pd.DataFrame, use_rsi: bool) -> list[dict
 
     # 震荡过滤：结合 EMA7/EMA25 间距与近 12 根 K 线高低振幅
     spread_pct = abs(ema7 - ema25) / ema25 * 100 if ema25 else 0.0
-    win = df.tail(min(len(df), 12))
-    range_pct = ((float(win["high"].max()) - float(win["low"].min())) / last_p * 100) if last_p else 0.0
+    win12 = df.tail(min(len(df), 12))
+    range_pct = ((float(win12["high"].max()) - float(win12["low"].min())) / last_p * 100) if last_p else 0.0
     is_choppy = spread_pct < 0.25 or range_pct < 0.85
+
+    win6 = df.tail(min(len(df), 6))
+    recent_low = float(win6["low"].min())
+    recent_high = float(win6["high"].max())
 
     ema7_up = ema7 > prev_ema7
     ema7_down = ema7 < prev_ema7
@@ -270,7 +289,6 @@ def _evaluate_candidate_strategies(df: pd.DataFrame, use_rsi: bool) -> list[dict
 
     candidates: list[dict] = []
 
-    # 1. 稳健短线档（偏顺势均线结构 + 震荡过滤）
     if not is_choppy and ema7 > ema25 and ema7_up and ema25_up and last_p >= ema25:
         pullback = abs(last_p - ema7) / ema7 <= 0.008
         reason = (
@@ -306,7 +324,6 @@ def _evaluate_candidate_strategies(df: pd.DataFrame, use_rsi: bool) -> list[dict
             "tp2_pct": 3.5,
         })
 
-    # 2. 快节奏短线档（偏近期 EMA7 拐头/突破 + 震荡过滤）
     if not is_choppy and (cross_up or (ema7_up and last_p > ema7 and last_p > prev_p)):
         reason = (
             "EMA7 上穿 EMA25 且价格走高，快节奏偏多信号。"
@@ -342,14 +359,32 @@ def _evaluate_candidate_strategies(df: pd.DataFrame, use_rsi: bool) -> list[dict
 
     for item in candidates:
         ep = float(item["entry"])
-        if item["side"].startswith("做多"):
-            item["sl_price"] = ep * (1 - item["sl_pct"] / 100)
-            item["tp1_price"] = ep * (1 + item["tp1_pct"] / 100)
-            item["tp2_price"] = ep * (1 + item["tp2_pct"] / 100)
+        is_l = item["side"].startswith("做多")
+        if is_l:
+            sl_p = ep * (1 - item["sl_pct"] / 100)
+            tp1_p = ep * (1 + item["tp1_pct"] / 100)
+            tp2_p = ep * (1 + item["tp2_pct"] / 100)
         else:
-            item["sl_price"] = ep * (1 + item["sl_pct"] / 100)
-            item["tp1_price"] = ep * (1 - item["tp1_pct"] / 100)
-            item["tp2_price"] = ep * (1 - item["tp2_pct"] / 100)
+            sl_p = ep * (1 + item["sl_pct"] / 100)
+            tp1_p = ep * (1 - item["tp1_pct"] / 100)
+            tp2_p = ep * (1 - item["tp2_pct"] / 100)
+
+        inv_p, inv_dir, inv_text = _build_early_invalid_line(
+            is_long=is_l,
+            coin_short=coin_short,
+            tf=tf,
+            entry_p=ep,
+            sl_p=sl_p,
+            ema25_p=ema25,
+            recent_low=recent_low,
+            recent_high=recent_high,
+        )
+        item["sl_price"] = sl_p
+        item["tp1_price"] = tp1_p
+        item["tp2_price"] = tp2_p
+        item["invalid_price"] = inv_p
+        item["invalid_dir"] = inv_dir
+        item["invalid_text"] = inv_text
 
     return candidates
 
@@ -390,6 +425,9 @@ def _sync_strategy_vault(
                 "sl_price": float(cand["sl_price"]),
                 "tp1_price": float(cand["tp1_price"]),
                 "tp2_price": float(cand["tp2_price"]),
+                "invalid_price": float(cand["invalid_price"]),
+                "invalid_dir": str(cand["invalid_dir"]),
+                "invalid_text": str(cand["invalid_text"]),
             }
             items.insert(0, snapshot)
             added += 1
@@ -399,13 +437,9 @@ def _sync_strategy_vault(
     return added
 
 
-def _apply_snapshot_to_position(snap: dict, sym_key: str) -> None:
-    st.session_state["pos_direction"] = snap["side"]
-    st.session_state["pos_entry_price"] = float(round(float(snap["entry"]), 6))
-    st.session_state["pos_sl_pct"] = float(snap["sl_pct"])
-    st.session_state["pos_tp1_pct"] = float(snap["tp1_pct"])
-    st.session_state["pos_tp2_pct"] = float(snap["tp2_pct"])
-    st.toast(f"已将锁定快照【{snap['mode']} · {snap['side']}】填入左侧出单提示（{sym_key}）")
+def _delete_snapshot(vault_key: str, snap_id: str) -> None:
+    items: list[dict] = list(st.session_state["strategy_vault"].get(vault_key, []))
+    st.session_state["strategy_vault"][vault_key] = [x for x in items if x["id"] != snap_id]
 
 
 interval_arg = refresh_sec if auto_refresh else None
@@ -414,6 +448,7 @@ interval_arg = refresh_sec if auto_refresh else None
 @st.fragment(run_every=interval_arg)
 def render_live_panel() -> None:
     active_symbol = symbol_input or "BTC/USDT"
+    coin_short = active_symbol.split("/")[0]
     vault_key = f"{exchange_choice}_{active_symbol}_{timeframe}"
     st.subheader(f"📌 当前选中币种实时卡片（{active_symbol} · {exchange_choice.upper()}）")
 
@@ -489,7 +524,7 @@ def render_live_panel() -> None:
             else:
                 st.info(advice_text)
 
-        # 独立策略区：锁定快照、震荡过滤 + RSI 辅助、价格接近去重
+        # 独立策略区：锁定快照、震荡过滤 + RSI 辅助、价格接近去重、单条删除、提前失效预警
         st.divider()
         hdr_l, hdr_r = st.columns([4, 1])
         with hdr_l:
@@ -499,7 +534,7 @@ def render_live_panel() -> None:
                 st.session_state["strategy_vault"][vault_key] = []
                 st.rerun(scope="fragment")
 
-        candidates = _evaluate_candidate_strategies(df, use_rsi=enable_rsi_assist)
+        candidates = _evaluate_candidate_strategies(df, coin_short=coin_short, tf=timeframe, use_rsi=enable_rsi_assist)
         added_cnt = _sync_strategy_vault(
             vault_key=vault_key,
             candidates=candidates,
@@ -522,16 +557,16 @@ def render_live_panel() -> None:
         else:
             for idx, snap in enumerate(vault_items):
                 with st.container(border=True):
-                    top_a, top_b, top_c = st.columns([2, 2, 1.4])
+                    top_a, top_b, top_c = st.columns([2.4, 1.8, 0.9])
                     top_a.markdown(f"**#{idx + 1} · {snap['mode']}** — {snap['badge']}（**{snap['side']}**）")
                     top_b.caption(f"锁定时间：{snap['created_at']}（价位已冻结）")
                     if top_c.button(
-                        "填入出单提示",
-                        key=f"use_snap_{vault_key}_{snap['id']}",
+                        "删除",
+                        key=f"del_snap_{vault_key}_{snap['id']}",
                         use_container_width=True,
                     ):
-                        _apply_snapshot_to_position(snap, active_symbol)
-                        st.rerun()
+                        _delete_snapshot(vault_key, snap["id"])
+                        st.rerun(scope="fragment")
 
                     st.caption(snap["reason"])
                     p1, p2, p3, p4 = st.columns(4)
@@ -539,6 +574,16 @@ def render_live_panel() -> None:
                     p2.write(f"锁定止损：**{_fmt_price(snap['sl_price'])}** (-{snap['sl_pct']:.1f}%)")
                     p3.write(f"锁定 TP1：**{_fmt_price(snap['tp1_price'])}** (+{snap['tp1_pct']:.1f}%)")
                     p4.write(f"锁定 TP2：**{_fmt_price(snap['tp2_price'])}** (+{snap['tp2_pct']:.1f}%)")
+
+                    inv_p = float(snap.get("invalid_price", 0.0))
+                    inv_dir = snap.get("invalid_dir", "")
+                    inv_text = snap.get("invalid_text", "")
+                    if inv_text and inv_p > 0:
+                        triggered = (inv_dir == "below" and last_p < inv_p) or (inv_dir == "above" and last_p > inv_p)
+                        if triggered:
+                            st.warning(f"🚨 已越过提前失效线（现价 {_fmt_price(last_p)}）—— {inv_text}")
+                        else:
+                            st.caption(f"🛡️ {inv_text}")
 
         st.divider()
         st.subheader(f"📉 {active_symbol} 价格与均线走势（EMA7 / EMA25）")
