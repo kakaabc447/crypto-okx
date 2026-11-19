@@ -54,6 +54,8 @@ max_strategy_items = st.sidebar.slider("最多保留策略条数", min_value=3, 
 
 if "strategy_vault" not in st.session_state:
     st.session_state["strategy_vault"] = {}
+if "global_strategy_history" not in st.session_state:
+    st.session_state["global_strategy_history"] = []
 
 st.sidebar.header("4. 持仓与出单提示")
 direction = st.sidebar.selectbox("持仓方向", ["做多 (Long)", "做空 (Short)"], index=0)
@@ -239,7 +241,6 @@ def _build_early_invalid_line(
 ) -> tuple[float, str, str]:
     """根据均线或近期结构高低点生成提前失效线（放在硬止损之前）。"""
     if is_long:
-        # 候选为出单时 EMA25 与近 6 根低点，挑出位于硬止损上方且低于入场价的结构位
         candidates = [p for p in (ema25_p, recent_low) if sl_p < p < entry_p]
         if candidates:
             inv_p = max(candidates)
@@ -391,12 +392,17 @@ def _evaluate_candidate_strategies(df: pd.DataFrame, coin_short: str, tf: str, u
 
 def _sync_strategy_vault(
     vault_key: str,
+    ex_name: str,
+    coin_short: str,
+    tf: str,
     candidates: list[dict],
     min_gap_pct: float,
     max_items: int,
+    max_global_items: int = 25,
 ) -> int:
-    """将符合条件且价格不重复的策略锁定快照存入独立策略区，返回本次新增条数。"""
+    """将符合条件且价格不重复的策略锁定快照存入独立策略区与全局历史记录，返回本次新增条数。"""
     items: list[dict] = list(st.session_state["strategy_vault"].get(vault_key, []))
+    global_items: list[dict] = list(st.session_state["global_strategy_history"])
     added = 0
 
     for cand in candidates:
@@ -411,9 +417,11 @@ def _sync_strategy_vault(
                         is_duplicate = True
                         break
         if not is_duplicate:
+            now_str = time.strftime("%H:%M:%S")
+            snap_id = f"{int(time.time() * 1000)}_{added}_{cand['mode']}"
             snapshot = {
-                "id": f"{int(time.time() * 1000)}_{added}_{cand['mode']}",
-                "created_at": time.strftime("%H:%M:%S"),
+                "id": snap_id,
+                "created_at": now_str,
                 "mode": cand["mode"],
                 "side": cand["side"],
                 "badge": cand["badge"],
@@ -428,13 +436,52 @@ def _sync_strategy_vault(
                 "invalid_price": float(cand["invalid_price"]),
                 "invalid_dir": str(cand["invalid_dir"]),
                 "invalid_text": str(cand["invalid_text"]),
+                "hit_tp1_at": None,
+                "hit_tp2_at": None,
+                "hit_sl_at": None,
             }
             items.insert(0, snapshot)
+            global_items.insert(0, {
+                "id": snap_id,
+                "time": now_str,
+                "ex": ex_name.upper(),
+                "coin": coin_short,
+                "tf": tf,
+                "badge": cand["badge"],
+                "entry": cand_entry,
+            })
             added += 1
 
     items = items[:max_items]
     st.session_state["strategy_vault"][vault_key] = items
+    st.session_state["global_strategy_history"] = global_items[:max_global_items]
     return added
+
+
+def _update_snapshot_hit_times(items: list[dict], last_p: float) -> list[dict]:
+    """根据当前最新价记录快照首次到达止损 / TP1 / TP2 的时间。"""
+    now_str = time.strftime("%H:%M:%S")
+    for snap in items:
+        is_long = str(snap.get("side", "")).startswith("做多")
+        sl_p = float(snap.get("sl_price", 0.0))
+        tp1_p = float(snap.get("tp1_price", 0.0))
+        tp2_p = float(snap.get("tp2_price", 0.0))
+
+        if is_long:
+            if tp1_p > 0 and last_p >= tp1_p and not snap.get("hit_tp1_at"):
+                snap["hit_tp1_at"] = now_str
+            if tp2_p > 0 and last_p >= tp2_p and not snap.get("hit_tp2_at"):
+                snap["hit_tp2_at"] = now_str
+            if sl_p > 0 and last_p <= sl_p and not snap.get("hit_sl_at"):
+                snap["hit_sl_at"] = now_str
+        else:
+            if tp1_p > 0 and last_p <= tp1_p and not snap.get("hit_tp1_at"):
+                snap["hit_tp1_at"] = now_str
+            if tp2_p > 0 and last_p <= tp2_p and not snap.get("hit_tp2_at"):
+                snap["hit_tp2_at"] = now_str
+            if sl_p > 0 and last_p >= sl_p and not snap.get("hit_sl_at"):
+                snap["hit_sl_at"] = now_str
+    return items
 
 
 def _delete_snapshot(vault_key: str, snap_id: str) -> None:
@@ -524,7 +571,7 @@ def render_live_panel() -> None:
             else:
                 st.info(advice_text)
 
-        # 独立策略区：锁定快照、震荡过滤 + RSI 辅助、价格接近去重、单条删除、提前失效预警
+        # 独立策略区：锁定快照、震荡过滤 + RSI 辅助、价格接近去重、单条删除、提前失效预警、到达时间记录
         st.divider()
         hdr_l, hdr_r = st.columns([4, 1])
         with hdr_l:
@@ -537,11 +584,18 @@ def render_live_panel() -> None:
         candidates = _evaluate_candidate_strategies(df, coin_short=coin_short, tf=timeframe, use_rsi=enable_rsi_assist)
         added_cnt = _sync_strategy_vault(
             vault_key=vault_key,
+            ex_name=exchange_choice,
+            coin_short=coin_short,
+            tf=timeframe,
             candidates=candidates,
             min_gap_pct=float(dedup_pct),
             max_items=int(max_strategy_items),
         )
-        vault_items = st.session_state["strategy_vault"].get(vault_key, [])
+        vault_items = _update_snapshot_hit_times(
+            list(st.session_state["strategy_vault"].get(vault_key, [])),
+            last_p=last_p,
+        )
+        st.session_state["strategy_vault"][vault_key] = vault_items
 
         status_note = (
             f"本次新增 {added_cnt} 条策略快照（去重阈值：{dedup_pct:.2f}%；已锁定参考价，不随现价跳动）"
@@ -574,6 +628,11 @@ def render_live_panel() -> None:
                     p2.write(f"锁定止损：**{_fmt_price(snap['sl_price'])}** (-{snap['sl_pct']:.1f}%)")
                     p3.write(f"锁定 TP1：**{_fmt_price(snap['tp1_price'])}** (+{snap['tp1_pct']:.1f}%)")
                     p4.write(f"锁定 TP2：**{_fmt_price(snap['tp2_price'])}** (+{snap['tp2_pct']:.1f}%)")
+
+                    t1, t2, t3 = st.columns(3)
+                    t1.caption(f"到 TP1 时间：{snap.get('hit_tp1_at') or '未到达'}")
+                    t2.caption(f"到 TP2 时间：{snap.get('hit_tp2_at') or '未到达'}")
+                    t3.caption(f"到止损时间：{snap.get('hit_sl_at') or '未到达'}")
 
                     inv_p = float(snap.get("invalid_price", 0.0))
                     inv_dir = snap.get("invalid_dir", "")
@@ -635,3 +694,18 @@ def render_live_panel() -> None:
 
 
 render_live_panel()
+
+# 左侧边栏：全局历史策略区（简略记录所有生成的策略）
+st.sidebar.divider()
+st.sidebar.header("5. 全局历史策略区")
+hist_items = st.session_state.get("global_strategy_history", [])
+if hist_items:
+    if st.sidebar.button("清空全局历史", key="clear_global_history", use_container_width=True):
+        st.session_state["global_strategy_history"] = []
+        st.rerun()
+    for g_item in hist_items:
+        st.sidebar.caption(
+            f"{g_item['time']} · {g_item['coin']} {g_item['tf']} · {g_item['badge']} @ {_fmt_price(float(g_item['entry']))}"
+        )
+else:
+    st.sidebar.caption("暂无历史策略记录，新快照生成后会自动汇总到这里。")
