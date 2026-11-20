@@ -109,12 +109,26 @@ tz_offset_hours = st.sidebar.number_input(
 st.sidebar.header("3. 策略过滤与去重")
 enable_rsi_assist = st.sidebar.checkbox("启用 RSI(14) 辅助提示", value=True)
 vol_mult_req = st.sidebar.slider(
-    "放量倍数门槛 (相对20均量)",
+    "盘中折算放量倍数 (相对20均量)",
     min_value=1.0,
     max_value=3.0,
-    value=1.25,
+    value=1.35,
     step=0.05,
-    help="上一根已收盘 K 线成交量需达到近 20 根均量的该倍数才出信号，过滤无量假动作",
+    help="按当前 K 线已走过的时间比例折算放量速度，需达到近 20 根均量的该倍数才出信号",
+)
+breakout_buf_pct = st.sidebar.number_input(
+    "均线突破缓冲 (%)",
+    min_value=0.0,
+    max_value=1.0,
+    value=0.15,
+    step=0.05,
+    format="%.2f",
+    help="现价站上/跌破均线需拉开至少该幅度，减少在均线边上来回贴线摩擦的假信号",
+)
+confirm_two_ticks = st.sidebar.checkbox(
+    "连续两轮刷新确认",
+    value=True,
+    help="同方向信号连续两次刷新都出现才正式锁单，减少一秒钟插针闪现",
 )
 dedup_pct = st.sidebar.number_input(
     "价格去重间距 (%)",
@@ -131,6 +145,8 @@ if "strategy_vault" not in st.session_state:
     st.session_state["strategy_vault"] = {}
 if "global_strategy_history" not in st.session_state:
     st.session_state["global_strategy_history"] = []
+if "pending_signal_streak" not in st.session_state:
+    st.session_state["pending_signal_streak"] = {}
 if "active_view" not in st.session_state:
     st.session_state["active_view"] = "live"
 
@@ -164,6 +180,11 @@ def _fmt_price(val: float) -> str:
     if abs(val) >= 1:
         return f"${val:,.4f}"
     return f"${val:,.6f}"
+
+
+def _tf_to_seconds(tf: str) -> int:
+    mapping = {"1m": 60, "5m": 300, "15m": 900, "1h": 3600}
+    return mapping.get(tf, 300)
 
 
 def _calc_rsi(close: pd.Series, period: int = 14) -> pd.Series:
@@ -366,49 +387,64 @@ def _build_early_invalid_line(
         return (inv_p, "above", msg)
 
 
+def _calc_intraday_pace_ratio(df: pd.DataFrame, tf: str) -> tuple[float, float]:
+    """计算当前盘中 K 线按时间进度折算后的放量倍数，返回 (折算放量倍数, 进度比例)。"""
+    vol_val = float(df["volume"].iloc[-1]) if "volume" in df.columns else 0.0
+    vol_ma = float(df["vol_ma20"].iloc[-1]) if "vol_ma20" in df.columns else 0.0
+    if vol_ma <= 0 or vol_val <= 0:
+        return (1.0, 1.0)
+
+    bar_sec = _tf_to_seconds(tf)
+    now_ms = int(time.time() * 1000)
+    last_ts = int(df["ts"].iloc[-1]) if "ts" in df.columns else now_ms
+    elapsed_sec = max(0.0, (now_ms - last_ts) / 1000.0)
+    progress = min(1.0, max(0.20, elapsed_sec / bar_sec)) if bar_sec > 0 else 1.0
+
+    projected_vol = vol_val / progress
+    pace_ratio = projected_vol / vol_ma
+    return (pace_ratio, progress)
+
+
 def _evaluate_candidate_strategies(
     df: pd.DataFrame,
     coin_short: str,
     tf: str,
     use_rsi: bool,
     vol_mult: float,
+    buf_pct: float,
 ) -> list[dict]:
-    """基于上一根已收盘 K 线（iloc[-2]）确认信号，结合放量过滤、ATR 动态止盈止损与同价双卡互斥。"""
-    if len(df) < 4:
+    """基于盘中最新价格（iloc[-1]）评估候选策略，加入时间折算放量、均线突破缓冲、ATR 动态点位与同价互斥。"""
+    if len(df) < 3:
         return []
 
-    # 使用已收盘 K 线（倒数第 2 根）确认信号，避免盘中未收盘 K 线虚晃
-    c_idx = -2
-    p_idx = -3
+    last_p = float(df["close"].iloc[-1])
+    prev_p = float(df["close"].iloc[-2])
+    ema7 = float(df["ema7"].iloc[-1])
+    prev_ema7 = float(df["ema7"].iloc[-2])
+    ema25 = float(df["ema25"].iloc[-1])
+    prev_ema25 = float(df["ema25"].iloc[-2])
+    rsi_val = float(df["rsi14"].iloc[-1]) if "rsi14" in df.columns else 50.0
+    atr_val = float(df["atr14"].iloc[-1]) if "atr14" in df.columns else max(last_p * 0.008, 1e-8)
 
-    sig_close = float(df["close"].iloc[c_idx])
-    prev_close = float(df["close"].iloc[p_idx])
-    ema7 = float(df["ema7"].iloc[c_idx])
-    prev_ema7 = float(df["ema7"].iloc[p_idx])
-    ema25 = float(df["ema25"].iloc[c_idx])
-    prev_ema25 = float(df["ema25"].iloc[p_idx])
-    rsi_val = float(df["rsi14"].iloc[c_idx]) if "rsi14" in df.columns else 50.0
-    atr_val = float(df["atr14"].iloc[c_idx]) if "atr14" in df.columns else max(sig_close * 0.008, 1e-8)
-    vol_val = float(df["volume"].iloc[c_idx]) if "volume" in df.columns else 0.0
-    vol_ma = float(df["vol_ma20"].iloc[c_idx]) if "vol_ma20" in df.columns else 0.0
+    pace_ratio, progress = _calc_intraday_pace_ratio(df, tf)
+    has_volume_confirm = pace_ratio >= vol_mult
 
-    # 放量过滤：无量行情不发出新单
-    has_volume_confirm = True if vol_ma <= 0 or vol_val <= 0 else (vol_val >= vol_ma * vol_mult)
-    vol_ratio = (vol_val / vol_ma) if vol_ma > 0 else 1.0
-
-    # 震荡过滤：结合 EMA7/EMA25 间距与近 12 根已收盘 K 线高低振幅
-    closed_df = df.iloc[:-1]
+    # 震荡过滤：结合 EMA7/EMA25 间距与近 12 根 K 线高低振幅
     spread_pct = abs(ema7 - ema25) / ema25 * 100 if ema25 else 0.0
-    win12 = closed_df.tail(min(len(closed_df), 12))
-    range_pct = ((float(win12["high"].max()) - float(win12["low"].min())) / sig_close * 100) if sig_close else 0.0
+    win12 = df.tail(min(len(df), 12))
+    range_pct = ((float(win12["high"].max()) - float(win12["low"].min())) / last_p * 100) if last_p else 0.0
     is_choppy = spread_pct < 0.25 or range_pct < 0.85
 
     if is_choppy or not has_volume_confirm:
         return []
 
-    win6 = closed_df.tail(min(len(closed_df), 6))
+    win6 = df.tail(min(len(df), 6))
     recent_low = float(win6["low"].min())
     recent_high = float(win6["high"].max())
+
+    buf_ratio = max(0.0, float(buf_pct)) / 100.0
+    above_ema7_buf = last_p >= ema7 * (1.0 + buf_ratio)
+    below_ema7_buf = last_p <= ema7 * (1.0 - buf_ratio)
 
     ema7_up = ema7 > prev_ema7
     ema7_down = ema7 < prev_ema7
@@ -417,40 +453,41 @@ def _evaluate_candidate_strategies(
     cross_up = prev_ema7 <= prev_ema25 and ema7 > ema25
     cross_down = prev_ema7 >= prev_ema25 and ema7 < ema25
 
+    pace_tag = f"折算放量{pace_ratio:.2f}x(进度{int(progress * 100)}%)"
     robust_cand: dict | None = None
     fast_cand: dict | None = None
 
     # 1. 先评估稳健短线
-    if ema7 > ema25 and ema7_up and ema25_up and sig_close >= ema25:
-        pullback = abs(sig_close - ema7) / ema7 <= 0.008
+    if ema7 > ema25 and ema7_up and ema25_up and last_p >= ema25 * (1.0 + buf_ratio * 0.5):
+        pullback = abs(last_p - ema7) / ema7 <= 0.008
         reason = (
-            f"已收盘放量({vol_ratio:.2f}x)确认，EMA7 高于 EMA25 且双均线向上，回踩 EMA7 企稳。"
+            f"{pace_tag}，EMA7 高于 EMA25 且双均线向上，回踩 EMA7 企稳。"
             if pullback
-            else f"已收盘放量({vol_ratio:.2f}x)确认，EMA7 高于 EMA25 且双均线向上，多头结构顺势。"
+            else f"{pace_tag}，EMA7 高于 EMA25 且双均线向上，多头结构顺势。"
         )
         robust_cand = {
             "mode": "稳健短线",
             "side": "做多 (Long)",
             "badge": "🟢 稳健做多",
             "reason": reason + _rsi_note("做多 (Long)", rsi_val, use_rsi),
-            "entry": sig_close,
+            "entry": last_p,
             "sl_mult": 1.5,
             "tp1_mult": 2.4,
             "tp2_mult": 4.0,
         }
-    elif ema7 < ema25 and ema7_down and ema25_down and sig_close <= ema25:
-        rebound = abs(sig_close - ema7) / ema7 <= 0.008
+    elif ema7 < ema25 and ema7_down and ema25_down and last_p <= ema25 * (1.0 - buf_ratio * 0.5):
+        rebound = abs(last_p - ema7) / ema7 <= 0.008
         reason = (
-            f"已收盘放量({vol_ratio:.2f}x)确认，EMA7 低于 EMA25 且双均线向下，反弹靠近 EMA7 受阻。"
+            f"{pace_tag}，EMA7 低于 EMA25 且双均线向下，反弹靠近 EMA7 受阻。"
             if rebound
-            else f"已收盘放量({vol_ratio:.2f}x)确认，EMA7 低于 EMA25 且双均线向下，空头结构顺势。"
+            else f"{pace_tag}，EMA7 低于 EMA25 且双均线向下，空头结构顺势。"
         )
         robust_cand = {
             "mode": "稳健短线",
             "side": "做空 (Short)",
             "badge": "🔴 稳健做空",
             "reason": reason + _rsi_note("做空 (Short)", rsi_val, use_rsi),
-            "entry": sig_close,
+            "entry": last_p,
             "sl_mult": 1.5,
             "tp1_mult": 2.4,
             "tp2_mult": 4.0,
@@ -458,41 +495,41 @@ def _evaluate_candidate_strategies(
 
     # 2. 只有未出“稳健短线”时才评估“快节奏短线”，避免同价双卡打架
     if robust_cand is None:
-        if cross_up or (ema7_up and sig_close > ema7 and sig_close > prev_close):
+        if (cross_up and above_ema7_buf) or (ema7_up and above_ema7_buf and last_p > prev_p):
             reason = (
-                f"已收盘放量({vol_ratio:.2f}x)，EMA7 上穿 EMA25 且收盘走高，快节奏偏多。"
+                f"{pace_tag}，EMA7 上穿 EMA25 且拉开 {buf_pct:.2f}% 缓冲，快节奏偏多。"
                 if cross_up
-                else f"已收盘放量({vol_ratio:.2f}x)，收盘站上 EMA7 且均线向上拐头，快节奏短多。"
+                else f"{pace_tag}，现价站稳 EMA7 之上（缓冲 {buf_pct:.2f}%）且均线向上，快节奏短多。"
             )
             fast_cand = {
                 "mode": "快节奏短线",
                 "side": "做多 (Long)",
                 "badge": "⚡ 快多脉冲",
                 "reason": reason + _rsi_note("做多 (Long)", rsi_val, use_rsi),
-                "entry": sig_close,
+                "entry": last_p,
                 "sl_mult": 0.9,
                 "tp1_mult": 1.4,
                 "tp2_mult": 2.5,
             }
-        elif cross_down or (ema7_down and sig_close < ema7 and sig_close < prev_close):
+        elif (cross_down and below_ema7_buf) or (ema7_down and below_ema7_buf and last_p < prev_p):
             reason = (
-                f"已收盘放量({vol_ratio:.2f}x)，EMA7 下穿 EMA25 且收盘走弱，快节奏偏空。"
+                f"{pace_tag}，EMA7 下穿 EMA25 且拉开 {buf_pct:.2f}% 缓冲，快节奏偏空。"
                 if cross_down
-                else f"已收盘放量({vol_ratio:.2f}x)，收盘跌破 EMA7 且均线向下拐头，快节奏短空。"
+                else f"{pace_tag}，现价跌破 EMA7 之下（缓冲 {buf_pct:.2f}%）且均线向下，快节奏短空。"
             )
             fast_cand = {
                 "mode": "快节奏短线",
                 "side": "做空 (Short)",
                 "badge": "⚡ 快空脉冲",
                 "reason": reason + _rsi_note("做空 (Short)", rsi_val, use_rsi),
-                "entry": sig_close,
+                "entry": last_p,
                 "sl_mult": 0.9,
                 "tp1_mult": 1.4,
                 "tp2_mult": 2.5,
             }
 
     candidates = [c for c in (robust_cand, fast_cand) if c is not None]
-    eff_atr = max(atr_val, sig_close * 0.0025)
+    eff_atr = max(atr_val, last_p * 0.0025)
 
     for item in candidates:
         ep = float(item["entry"])
@@ -531,6 +568,29 @@ def _evaluate_candidate_strategies(
         item["invalid_text"] = inv_text
 
     return candidates
+
+
+def _filter_by_two_tick_streak(vault_key: str, candidates: list[dict], require_two_ticks: bool) -> list[dict]:
+    """若开启连续两轮刷新确认，则同方向候选信号连续出现两次才放行。"""
+    streaks: dict[str, int] = dict(st.session_state["pending_signal_streak"])
+    active_keys = {f"{vault_key}|{c['mode']}|{c['side']}" for c in candidates}
+
+    # 清理本 vault 下本轮未出现的信号计数
+    prefix = f"{vault_key}|"
+    for k in list(streaks.keys()):
+        if k.startswith(prefix) and k not in active_keys:
+            del streaks[k]
+
+    confirmed: list[dict] = []
+    for cand in candidates:
+        sig_key = f"{vault_key}|{cand['mode']}|{cand['side']}"
+        cnt = streaks.get(sig_key, 0) + 1
+        streaks[sig_key] = cnt
+        if not require_two_ticks or cnt >= 2:
+            confirmed.append(cand)
+
+    st.session_state["pending_signal_streak"] = streaks
+    return confirmed
 
 
 def _upsert_global_history(record: dict, max_global_items: int = 50) -> None:
@@ -761,29 +821,35 @@ else:
                 else:
                     st.info(advice_text)
 
-            # 独立策略区：已收盘确认 + 放量过滤 + ATR 动态点位 + 同价互斥 + 锁价去重
+            # 独立策略区：盘中现价 + 时间折算放量 + 突破缓冲 + 连续两轮确认 + ATR动态 + 锁价去重
             st.divider()
             hdr_l, hdr_r = st.columns([4, 1])
             with hdr_l:
-                st.subheader(f"🎯 独立短线策略区（{active_symbol} · {timeframe} · ATR动态+锁价去重）")
+                st.subheader(f"🎯 独立短线策略区（{active_symbol} · {timeframe} · 盘中快进+稳健过滤）")
             with hdr_r:
                 if st.button("清空本币策略", key=f"clear_vault_{vault_key}", use_container_width=True):
                     st.session_state["strategy_vault"][vault_key] = []
                     st.rerun(scope="fragment")
 
-            candidates = _evaluate_candidate_strategies(
+            raw_candidates = _evaluate_candidate_strategies(
                 df,
                 coin_short=coin_short,
                 tf=timeframe,
                 use_rsi=enable_rsi_assist,
                 vol_mult=float(vol_mult_req),
+                buf_pct=float(breakout_buf_pct),
+            )
+            confirmed_candidates = _filter_by_two_tick_streak(
+                vault_key=vault_key,
+                candidates=raw_candidates,
+                require_two_ticks=bool(confirm_two_ticks),
             )
             added_cnt = _sync_strategy_vault(
                 vault_key=vault_key,
                 ex_name=exchange_choice,
                 coin_short=coin_short,
                 tf=timeframe,
-                candidates=candidates,
+                candidates=confirmed_candidates,
                 min_gap_pct=float(dedup_pct),
                 max_items=int(max_strategy_items),
                 tz_offset=int(tz_offset_hours),
@@ -795,16 +861,17 @@ else:
             )
             st.session_state["strategy_vault"][vault_key] = vault_items
 
+            streak_tag = "两轮确认" if confirm_two_ticks else "单轮即出"
             status_note = (
-                f"本次新增 {added_cnt} 条策略快照（已收盘确认｜放量≥{vol_mult_req:.2f}x｜ATR动态点位｜去重{dedup_pct:.2f}%）"
+                f"本次新增 {added_cnt} 条策略快照（盘中现价｜折算放量≥{vol_mult_req:.2f}x｜缓冲{breakout_buf_pct:.2f}%｜{streak_tag}｜去重{dedup_pct:.2f}%）"
                 if added_cnt > 0
-                else f"当前无新不重复单据（已收盘确认｜放量≥{vol_mult_req:.2f}x｜去重{dedup_pct:.2f}%；已有快照已锁价）"
+                else f"当前无新不重复单据（盘中现价｜折算放量≥{vol_mult_req:.2f}x｜缓冲{breakout_buf_pct:.2f}%｜{streak_tag}｜去重{dedup_pct:.2f}%）"
             )
             st.caption(status_note)
 
             if not vault_items:
                 st.info(
-                    "当前处于震荡过滤、量能不足或暂无新信号，独立策略区暂未生成新单据。满足已收盘放量条件且拉开去重间距后会出现在这里。"
+                    "当前处于震荡过滤、折算量能不足、未过突破缓冲或等待连续两轮确认，暂未生成新单据。符合条件且拉开去重间距后会出现在这里。"
                 )
             else:
                 for idx, snap in enumerate(vault_items):
